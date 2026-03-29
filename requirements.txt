@@ -1,0 +1,7 @@
+mediapipe>=0.10
+opencv-python
+numpy
+# 如果你只需要 tflite 运行时（可选）：
+# tflite-runtime
+Pillow>=10.0.0
+pywin32>=305

@@ -1,0 +1,40 @@
+/**
+ * @see https://www.electron.build/configuration/configuration
+ */
+{
+  $schema: 'https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json',
+  appId: 'YourAppID',
+  asar: true,
+  productName: 'Awesome Hands',
+  directories: {
+    output: 'release/${version}'
+  },
+  // 打包后需要的文件
+  files: ['dist', 'dist-electron'],
+  mac: {
+    icon: 'dist/images/icons/MainWindow.icns',
+    target: ['dmg'],
+    artifactName: '${productName}-Mac-${version}-Installer.${ext}'
+  },
+  win: {
+    icon: 'dist/images/icons/MainWindow.ico',
+    target: [
+      {
+        target: 'nsis',
+        arch: ['x64']
+      }
+    ],
+    requestedExecutionLevel: "requireAdministrator",
+    artifactName: '${productName}-Windows-${version}-Setup.${ext}'
+  },
+  nsis: {
+    oneClick: false, // 是否支持一键安装
+    perMachine: false, // 仅安装到当前用户的个人文件夹
+    allowToChangeInstallationDirectory: true,
+    deleteAppDataOnUninstall: true
+  },
+  linux: {
+    target: ['AppImage'],
+    artifactName: '${productName}-Linux-${version}.${ext}'
+  }
+}

@@ -6,6 +6,7 @@ Uses the project's `ReXNetV1` (or other backbone) weights in
   - `fist`, `one` (index up), `thumb_up`, `open` (all fingers extended)
 
 Run:
+  cd "handpose_x-main (1)\handpose_x-main"
   python gesture_realtime.py --model_path "handpose_x 预训练模型/ReXNetV1-size-256-wingloss102-0.122.pth"
 
 This script depends on the project's model definitions and utils.

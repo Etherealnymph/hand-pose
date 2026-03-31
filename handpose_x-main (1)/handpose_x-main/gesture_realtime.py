@@ -74,6 +74,28 @@ def euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
 
+def joint_angle(mcp, pip, tip):
+    """Return angle at `pip` formed by vectors (mcp->pip) and (tip->pip) in degrees.
+    When finger is extended, angle ~ 180; when folded, angle ~ 0.
+    """
+    try:
+        v1x = mcp[0] - pip[0]
+        v1y = mcp[1] - pip[1]
+        v2x = tip[0] - pip[0]
+        v2y = tip[1] - pip[1]
+        dot = v1x * v2x + v1y * v2y
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+        denom = n1 * n2
+        if denom < 1e-8:
+            return 0.0
+        cosv = max(-1.0, min(1.0, dot / denom))
+        ang = math.degrees(math.acos(cosv))
+        return ang
+    except Exception:
+        return 0.0
+
+
 def detect_gesture(pts, img_w, img_h):
     """Improved rule-based gesture detection.
     Returns (gesture_name_or_None, finger_states_list)
@@ -87,22 +109,38 @@ def detect_gesture(pts, img_w, img_h):
         mcp_pts = [(pts[str(i)]['x'], pts[str(i)]['y']) for i in mcps_idx]
     except Exception:
         return None, ['U']*5
-
+    # Use pip points to determine finger extension more robustly
+    # Indices follow common 21-point layout: pip indices are [2,6,10,14,18]
+    pip_idx = [2,6,10,14,18]
     hand_scale = euclid(wrist, tip_pts[2])
     if hand_scale < 1e-6:
         hand_scale = 1.0
 
-    rel = [euclid(tip_pts[i], mcp_pts[i]) / hand_scale for i in range(5)]
+    # angle-based test at pip joint (degrees). extended ~ 180, folded ~ 0
+    ext_angle_thresh = 150.0
+    fold_angle_thresh = 100.0
 
-    # empirical thresholds, tuned for relative ratios
-    folded_thresh = 0.45
-    extended_thresh = 0.6
+    states = []
+    extended = []
+    folded = []
 
-    extended = [r > extended_thresh for r in rel]
-    folded = [r < folded_thresh for r in rel]
-    states = [ 'E' if extended[i] else ('F' if folded[i] else 'U') for i in range(5) ]
+    # For each finger, compute angle at PIP (mcp - pip - tip)
+    for i in range(5):
+        try:
+            tip = tip_pts[i]
+            pip = (pts[str(pip_idx[i])]['x'], pts[str(pip_idx[i])]['y'])
+            mcp = mcp_pts[i]
+            ang = joint_angle(mcp, pip, tip)
+        except Exception:
+            ang = 0.0
 
-    # Gesture rules
+        is_ext = ang >= ext_angle_thresh
+        is_fold = ang <= fold_angle_thresh
+        extended.append(is_ext)
+        folded.append(is_fold)
+        states.append('E' if is_ext else ('F' if is_fold else 'U'))
+
+    # Gesture rules (use more tolerant checks)
     # fist: all folded
     if all(folded):
         return 'fist', states
@@ -111,7 +149,15 @@ def detect_gesture(pts, img_w, img_h):
     if extended[1] and all(not extended[i] for i in [0,2,3,4]):
         return 'one', states
 
-    # thumb up: thumb extended and thumb tip is above wrist by margin
+    # two: index and middle extended
+    if extended[1] and extended[2] and all(not extended[i] for i in [0,3,4]):
+        return 'two', states
+
+    # three: index, middle, ring extended
+    if extended[1] and extended[2] and extended[3] and not extended[0] and not extended[4]:
+        return 'three', states
+
+    # thumb up: thumb extended and tip above wrist by margin
     if extended[0] and all(not extended[i] for i in [1,2,3,4]):
         thumb_tip = tip_pts[0]
         if thumb_tip[1] < wrist[1] - 0.15 * hand_scale:
@@ -133,6 +179,11 @@ def main():
     parser.add_argument('--img_size', type=tuple , default = (256,256))
     parser.add_argument('--camera_id', type=int, default = 0)
     parser.add_argument('--vis', type=bool , default = True)
+    parser.add_argument('--min_hand_scale', type=float, default = 0.02, help='min hand scale (fraction of short side) to consider hand present')
+    parser.add_argument('--hand_presence_frames', type=int, default = 3, help='number of consecutive frames to confirm hand presence')
+    parser.add_argument('--finger_alpha', type=float, default = 0.3, help='EMA alpha for smoothing per-finger angle values')
+    parser.add_argument('--ext_thresh', type=float, default = 150.0, help='threshold on smoothed angle (deg) to consider finger extended')
+    parser.add_argument('--fold_thresh', type=float, default = 100.0, help='threshold on smoothed angle (deg) to consider finger folded')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUS
@@ -162,6 +213,13 @@ def main():
 
     prev_time = time.time()
     fps_smooth = None
+    # hand presence smoothing counters
+    hand_presence_counter = 0
+    hand_absence_counter = 0
+    hand_is_present = False
+    # per-finger smoothed angles (degrees) and states: helps avoid sticky 'E'/'U' and rapid jitter
+    finger_angle_avg = [0.0] * 5
+    finger_state = ['U'] * 5
 
     with torch.no_grad():
         while True:
@@ -184,22 +242,113 @@ def main():
                 y = (output[i*2+1]*float(h))
                 pts_hand[str(i)] = {"x":x, "y":y}
 
-            # draw skeleton and points
+            # 判断画面是否有手：通过手腕到中指尖的像素距离作为 hand_scale
             try:
-                draw_bd_handpose(frame, pts_hand, 0, 0)
+                wrist = (pts_hand['0']['x'], pts_hand['0']['y'])
+                mid_tip = (pts_hand['12']['x'], pts_hand['12']['y'])
+                hand_scale = euclid(wrist, mid_tip)
             except Exception:
-                pass
-            for i in range(int(output.shape[0]/2)):
-                x = (output[i*2+0]*float(w))
-                y = (output[i*2+1]*float(h))
-                cv2.circle(frame, (int(x),int(y)), 3, (255,50,60), -1)
+                hand_scale = 0.0
 
-            gesture, states = detect_gesture(pts_hand, w, h)
-            if gesture is not None:
+            # 阈值：取图像较短边的 min_hand_scale（可调整）
+            min_hand_scale_px = min(w, h) * args.min_hand_scale
+            has_hand = hand_scale >= min_hand_scale_px
+
+            # 平滑：需要连续若干帧确认手存在/消失，避免噪声导致闪烁
+            if has_hand:
+                hand_presence_counter += 1
+                hand_absence_counter = 0
+            else:
+                hand_absence_counter += 1
+                hand_presence_counter = 0
+
+            if hand_presence_counter >= args.hand_presence_frames:
+                hand_is_present = True
+            if hand_absence_counter >= args.hand_presence_frames:
+                hand_is_present = False
+
+            if hand_is_present:
+                # draw skeleton and points
+                try:
+                    draw_bd_handpose(frame, pts_hand, 0, 0)
+                except Exception:
+                    pass
+                for i in range(int(output.shape[0]/2)):
+                    x = (output[i*2+0]*float(w))
+                    y = (output[i*2+1]*float(h))
+                    cv2.circle(frame, (int(x),int(y)), 3, (255,50,60), -1)
+
+                # compute per-finger angle at PIP and apply EMA smoothing
+                tips_idx = [4,8,12,16,20]
+                pip_idx = [2,6,10,14,18]
+                mcps_idx = [1,5,9,13,17]
+                extended = [False]*5
+                for i in range(5):
+                    try:
+                        tip = (pts_hand[str(tips_idx[i])]['x'], pts_hand[str(tips_idx[i])]['y'])
+                        pip = (pts_hand[str(pip_idx[i])]['x'], pts_hand[str(pip_idx[i])]['y'])
+                        mcp = (pts_hand[str(mcps_idx[i])]['x'], pts_hand[str(mcps_idx[i])]['y'])
+                        ang = joint_angle(mcp, pip, tip)
+                    except Exception:
+                        ang = 0.0
+                    # EMA smoothing on angle (degrees)
+                    alpha = max(0.0, min(1.0, args.finger_alpha))
+                    finger_angle_avg[i] = finger_angle_avg[i] * (1.0 - alpha) + ang * alpha
+                    # hysteresis thresholds to avoid flicker (angles in degrees)
+                    if finger_angle_avg[i] >= args.ext_thresh:
+                        finger_state[i] = 'E'
+                        extended[i] = True
+                    elif finger_angle_avg[i] <= args.fold_thresh:
+                        finger_state[i] = 'F'
+                        extended[i] = False
+                    else:
+                        # keep previous state if in between, otherwise unknown
+                        if finger_state[i] in ('E','F'):
+                            extended[i] = (finger_state[i] == 'E')
+                        else:
+                            finger_state[i] = 'U'
+                            extended[i] = False
+
+                # determine gesture based on smoothed discrete states
+                gesture = None
+                # fist: all folded
+                if all(s == 'F' for s in finger_state):
+                    gesture = 'fist'
+                # one: only index extended
+                elif extended[1] and all(not extended[i] for i in [0,2,3,4]):
+                    gesture = 'one'
+                # two: index and middle
+                elif extended[1] and extended[2] and all(not extended[i] for i in [0,3,4]):
+                    gesture = 'two'
+                # three: index, middle, ring
+                elif extended[1] and extended[2] and extended[3] and not extended[0] and not extended[4]:
+                    gesture = 'three'
+                # thumb up: thumb extended and tip above wrist by margin
+                elif extended[0] and all(not extended[i] for i in [1,2,3,4]):
+                    try:
+                        wrist = (pts_hand['0']['x'], pts_hand['0']['y'])
+                        thumb_tip = (pts_hand['4']['x'], pts_hand['4']['y'])
+                        if thumb_tip[1] < wrist[1] - 0.15 * hand_scale:
+                            gesture = 'thumb_up'
+                    except Exception:
+                        pass
+                # open: majority extended
+                elif sum(1 for v in extended if v) >= 4:
+                    gesture = 'open'
+                states = finger_state
+            else:
+                # 无手：不绘制关键点，手势为空，重置平滑值与状态
+                gesture = None
+                states = ['U']*5
+                finger_angle_avg = [0.0] * 5
+                finger_state = ['U'] * 5
+            # 仅当手存在且识别出手势时显示手势文本
+            if hand_is_present and gesture is not None:
                 cv2.putText(frame, 'Gesture: %s' % gesture, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
-            # show finger states (Thumb,Index,Mid,Ring,Pinky)
-            state_str = ' '.join(states)
-            cv2.putText(frame, 'Fingers: %s' % state_str, (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,50), 2)
+            # show finger states only when hand is present
+            if hand_is_present:
+                state_str = ' '.join(states)
+                cv2.putText(frame, 'Fingers: %s' % state_str, (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,50), 2)
 
             # FPS
             now = time.time()

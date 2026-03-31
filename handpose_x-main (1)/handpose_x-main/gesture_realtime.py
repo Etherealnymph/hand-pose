@@ -157,6 +157,14 @@ def detect_gesture(pts, img_w, img_h):
     if extended[1] and extended[2] and extended[3] and not extended[0] and not extended[4]:
         return 'three', states
 
+    # four: index, middle, ring, pinky extended (thumb not)
+    if extended[1] and extended[2] and extended[3] and extended[4] and not extended[0]:
+        return 'four', states
+
+    # five: all five fingers extended
+    if all(extended):
+        return 'five', states
+
     # thumb up: thumb extended and tip above wrist by margin
     if extended[0] and all(not extended[i] for i in [1,2,3,4]):
         thumb_tip = tip_pts[0]
@@ -184,6 +192,10 @@ def main():
     parser.add_argument('--finger_alpha', type=float, default = 0.3, help='EMA alpha for smoothing per-finger angle values')
     parser.add_argument('--ext_thresh', type=float, default = 150.0, help='threshold on smoothed angle (deg) to consider finger extended')
     parser.add_argument('--fold_thresh', type=float, default = 100.0, help='threshold on smoothed angle (deg) to consider finger folded')
+    parser.add_argument('--concentration_thresh', type=float, default = 0.03, help='if 21 pts span less than fraction of short side, treat as no hand')
+    parser.add_argument('--tip_pip_min', type=float, default = 0.03, help='min tip-pip distance (fraction of short side) to consider finger not collapsed')
+    parser.add_argument('--per_finger_conc_thresh', type=float, default = 0.02, help='per-finger concentration threshold (fraction of short side) to consider finger collapsed')
+    parser.add_argument('--thumb_collapse_thresh', type=float, default = 0.018, help='thumb tip-to-mcp collapse threshold (fraction of short side) to consider thumb folded')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUS
@@ -217,6 +229,7 @@ def main():
     hand_presence_counter = 0
     hand_absence_counter = 0
     hand_is_present = False
+    concentrated_flag = False
     # per-finger smoothed angles (degrees) and states: helps avoid sticky 'E'/'U' and rapid jitter
     finger_angle_avg = [0.0] * 5
     finger_state = ['U'] * 5
@@ -254,6 +267,22 @@ def main():
             min_hand_scale_px = min(w, h) * args.min_hand_scale
             has_hand = hand_scale >= min_hand_scale_px
 
+            # 检测 21 点是否过度集中（例如误检单点或噪声）——若过于集中则视为无手
+            try:
+                pts_count = int(output.shape[0] / 2)
+                xs = [pts_hand[str(i)]['x'] for i in range(pts_count)]
+                ys = [pts_hand[str(i)]['y'] for i in range(pts_count)]
+                max_span = max(max(xs) - min(xs), max(ys) - min(ys))
+            except Exception:
+                max_span = 0.0
+            concentration_thresh_px = min(w, h) * args.concentration_thresh
+            is_concentrated = (max_span < concentration_thresh_px)
+
+            # 若过度集中则当作无手（但记录以显示 'none'）
+            concentrated_flag = is_concentrated
+            if concentrated_flag:
+                has_hand = False
+
             # 平滑：需要连续若干帧确认手存在/消失，避免噪声导致闪烁
             if has_hand:
                 hand_presence_counter += 1
@@ -283,6 +312,8 @@ def main():
                 pip_idx = [2,6,10,14,18]
                 mcps_idx = [1,5,9,13,17]
                 extended = [False]*5
+                tip_pip_min_px = min(w, h) * args.tip_pip_min
+                thumb_collapse_px = min(w, h) * args.thumb_collapse_thresh
                 for i in range(5):
                     try:
                         tip = (pts_hand[str(tips_idx[i])]['x'], pts_hand[str(tips_idx[i])]['y'])
@@ -295,10 +326,37 @@ def main():
                     alpha = max(0.0, min(1.0, args.finger_alpha))
                     finger_angle_avg[i] = finger_angle_avg[i] * (1.0 - alpha) + ang * alpha
                     # hysteresis thresholds to avoid flicker (angles in degrees)
-                    if finger_angle_avg[i] >= args.ext_thresh:
+                    # 除了角度外，还要求 tip-pip 距离不能太小（避免点集中时误判为伸展）
+                    try:
+                        tip_pip_dist = euclid(tip, pip)
+                    except Exception:
+                        tip_pip_dist = 0.0
+                    
+                    # per-finger concentration: measure span on this finger (tip-pip, pip-mcp, tip-mcp)
+                    try:
+                        pip_mcp_dist = euclid(pip, mcp)
+                        tip_mcp_dist = euclid(tip, mcp)
+                        finger_span = max(tip_pip_dist, pip_mcp_dist, tip_mcp_dist)
+                    except Exception:
+                        pip_mcp_dist = 0.0
+                        tip_mcp_dist = 0.0
+                        finger_span = 0.0
+
+                    is_ext = (finger_angle_avg[i] >= args.ext_thresh) and (tip_pip_dist >= tip_pip_min_px)
+                    # consider finger folded if angle low OR tip-pip very small OR per-finger span below threshold
+                    per_finger_conc_px = min(w, h) * args.per_finger_conc_thresh
+                    # special-case thumb: if thumb tip-to-mcp distance becomes very small, mark as folded
+                    thumb_collapsed = False
+                    try:
+                        if i == 0 and tip_mcp_dist < thumb_collapse_px:
+                            thumb_collapsed = True
+                    except Exception:
+                        thumb_collapsed = False
+                    is_fold = (finger_angle_avg[i] <= args.fold_thresh) or (tip_pip_dist < (0.6 * tip_pip_min_px)) or (finger_span < per_finger_conc_px) or thumb_collapsed
+                    if is_ext:
                         finger_state[i] = 'E'
                         extended[i] = True
-                    elif finger_angle_avg[i] <= args.fold_thresh:
+                    elif is_fold:
                         finger_state[i] = 'F'
                         extended[i] = False
                     else:
@@ -323,6 +381,12 @@ def main():
                 # three: index, middle, ring
                 elif extended[1] and extended[2] and extended[3] and not extended[0] and not extended[4]:
                     gesture = 'three'
+                # four: index, middle, ring, pinky (thumb not)
+                elif extended[1] and extended[2] and extended[3] and extended[4] and not extended[0]:
+                    gesture = 'four'
+                # five: all five
+                elif all(extended):
+                    gesture = 'five'
                 # thumb up: thumb extended and tip above wrist by margin
                 elif extended[0] and all(not extended[i] for i in [1,2,3,4]):
                     try:
@@ -342,8 +406,10 @@ def main():
                 states = ['U']*5
                 finger_angle_avg = [0.0] * 5
                 finger_state = ['U'] * 5
-            # 仅当手存在且识别出手势时显示手势文本
-            if hand_is_present and gesture is not None:
+            # 显示手势文本：若点集中则显示 'none'，否则仅当手存在且识别出手势时显示
+            if concentrated_flag:
+                cv2.putText(frame, 'Gesture: none', (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
+            elif hand_is_present and gesture is not None:
                 cv2.putText(frame, 'Gesture: %s' % gesture, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
             # show finger states only when hand is present
             if hand_is_present:

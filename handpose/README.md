@@ -8,6 +8,7 @@ numpy: 2.2.6
 torch: 2.11.0+cpu
 opencv/cv2: 4.10.0
 thop: 0.1.1
+模型地址：ReXNetV1-size-256-wingloss102-0.122.pth（已经在文件中）
 
 代码实现了1-8，OK，shit（小指单举），fuckyou（中指单举），fist，thumb_up，左右手的共计26种手势识别
 

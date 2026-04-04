@@ -8,12 +8,9 @@ Uses the project's `ReXNetV1` (or other backbone) weights in
 
 Run:
   cd "handpose_x-main (1)\handpose_x-main"
-  python gesture_realtime.py --model_path "handpose_x 预训练模型/ReXNetV1-size-256-wingloss102-0.122.pth"
+  python gesture_realtime.py --model_path "handpose_x 预训练模型/ReXNetV1-size-256-wingloss102-0.122.pth" --use_skin True --remove_head True
 
 This script depends on the project's model definitions and utils.
-
-Realtime gesture recognition using hand keypoints from pre-trained handpose model.
-Fixed thumb folding detection issue.
 """
 
 import os
@@ -232,8 +229,14 @@ def detect_gesture(pts, img_w, img_h):
     if extended[0] and extended[1] and all(not extended[i] for i in [2,3,4]):
         return '7', states
 
-    # OK: middle + ring + pinky
-    if extended[2] and extended[3] and extended[4] and not extended[0] and not extended[1]:
+    # OK: 拇指与食指指尖距离小于阈值，且中指/无名指/小拇指伸展
+    try:
+        thumb_tip = tip_pts[0]
+        index_tip = tip_pts[1]
+        tip_dist = euclid(thumb_tip, index_tip)
+    except Exception:
+        tip_dist = float('inf')
+    if tip_dist < 0.15 * hand_scale and extended[2] and extended[3] and extended[4]:
         return 'OK', states
 
     # 8: thumb + index + middle
@@ -301,6 +304,9 @@ def main():
     parser.add_argument('--per_finger_conc_thresh', type=float, default = 0.02, help='per-finger concentration threshold (fraction of short side) to consider finger collapsed')
     parser.add_argument('--thumb_collapse_thresh', type=float, default = 0.018, help='thumb tip-to-mcp collapse threshold (fraction of short side) to consider thumb folded')
     parser.add_argument('--thumb_ratio_thresh', type=float, default = DEFAULT_THUMB_RATIO_THRESH, help='ratio threshold for thumb')
+    parser.add_argument('--use_skin', type=bool, default = True, help='whether to apply skin-color masking before inference')
+    parser.add_argument('--remove_head', type=bool, default = True, help='whether to mask detected face/head region to avoid influence')
+    parser.add_argument('--ok_tip_dist_frac', type=float, default = 0.15, help='fraction of hand_scale used as OK thumb-index tip distance threshold')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPUS
@@ -308,6 +314,12 @@ def main():
     device = torch.device('cuda:0' if use_cuda else 'cpu')
 
     model_ = build_model(args.model, args.num_classes, args.img_size[0], device)
+
+    # 加载人脸检测器（用于屏蔽头部区域，减少干扰）
+    try:
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    except Exception:
+        face_cascade = None
 
     if os.access(args.model_path, os.F_OK):
         chkpt = torch.load(args.model_path, map_location=device)
@@ -344,7 +356,44 @@ def main():
                 break
 
             h, w = frame.shape[:2]
-            img_t = preprocess_frame(frame, args.img_size)
+
+            # 可选：先基于肤色检测出手部区域，再屏蔽人脸区域，避免脑袋对手势的影响
+            frame_proc = frame.copy()
+            try:
+                if args.use_skin:
+                    hsv = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2HSV)
+                    # 常用肤色 HSV 范围 & YCrCb 辅助
+                    lower_hsv = np.array([0, 30, 60])
+                    upper_hsv = np.array([25, 200, 255])
+                    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+                    ycrcb = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2YCrCb)
+                    lower_ycrcb = np.array((0,133,77))
+                    upper_ycrcb = np.array((255,173,127))
+                    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+
+                    skin_mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+                    # 形态学去噪
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+                    skin_mask = cv2.medianBlur(skin_mask, 5)
+                    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+                    # 若启用 remove_head，则检测人脸并从 mask 中移除人脸区域
+                    if args.remove_head and face_cascade is not None:
+                        gray = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2GRAY)
+                        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
+                        for (fx,fy,fw,fh) in faces:
+                            cv2.rectangle(skin_mask, (fx,fy), (fx+fw, fy+fh), 0, -1)
+
+                    # 将非皮肤区域设为中灰(128)，以降低对回归模型的误导
+                    inv_mask = cv2.bitwise_not(skin_mask)
+                    frame_proc[inv_mask>0] = (128,128,128)
+                else:
+                    frame_proc = frame
+            except Exception:
+                frame_proc = frame
+
+            img_t = preprocess_frame(frame_proc, args.img_size)
             if use_cuda:
                 img_t = img_t.cuda()
 
@@ -554,8 +603,6 @@ def main():
                     gesture = '6'
                 elif extended[0] and extended[1] and all(not extended[i] for i in [2,3,4]):
                     gesture = '7'
-                elif extended[2] and extended[3] and extended[4] and not extended[0] and not extended[1]:
-                    gesture = 'OK'
                 elif extended[0] and extended[1] and extended[2] and all(not extended[i] for i in [3,4]):
                     gesture = '8'
                 elif extended[2] and all(not extended[i] for i in [0,1,3,4]):
@@ -578,7 +625,29 @@ def main():
                         pass
                 elif sum(1 for v in extended if v) >= 4:
                     gesture = 'open'
+                elif True:
+                    # 改为：拇指与食指指尖距离小于阈值，且中指/无名指/小拇指伸展
+                    try:
+                        thumb_tip = (pts_hand['4']['x'], pts_hand['4']['y']) if '4' in pts_hand else None
+                        index_tip = (pts_hand['8']['x'], pts_hand['8']['y']) if '8' in pts_hand else None
+                        if thumb_tip is not None and index_tip is not None:
+                            tip_dist = euclid(thumb_tip, index_tip)
+                        else:
+                            tip_dist = float('inf')
+                    except Exception:
+                        tip_dist = float('inf')
+                    if tip_dist < 0.15 * hand_scale and extended[2] and extended[3] and extended[4]:
+                        gesture = 'OK'
                 states = finger_state
+                # 判断左右手：基于拇指尖相对于掌心的横向位置（图像坐标）
+                try:
+                    thumb_tip_disp = (pts_hand['4']['x'], pts_hand['4']['y']) if '4' in pts_hand else None
+                    if thumb_tip_disp is not None:
+                        hand_side = 'Left' if thumb_tip_disp[0] < palm_center[0] else 'Right'
+                    else:
+                        hand_side = 'Unknown'
+                except Exception:
+                    hand_side = 'Unknown'
             else:
                 gesture = None
                 states = ['U']*5
@@ -588,7 +657,9 @@ def main():
             if concentrated_flag:
                 cv2.putText(frame, 'Gesture: none', (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
             elif hand_is_present and gesture is not None:
-                cv2.putText(frame, 'Gesture: %s' % gesture, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
+                # 在显示中加入左右手信息
+                side_str = (' (%s)' % hand_side) if 'hand_side' in locals() else ''
+                cv2.putText(frame, 'Gesture: %s%s' % (gesture, side_str), (10,60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,200,255), 2)
             if hand_is_present:
                 state_str = ' '.join(states)
                 cv2.putText(frame, 'Fingers: %s' % state_str, (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,50), 2)
